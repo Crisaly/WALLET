@@ -268,6 +268,7 @@
   .pbtns .pri { background: #0A84FF; color: #fff; } .pbtns .dng { background: #FF453A; color: #fff; }
   .pbtns button:disabled { opacity: .5; }
   .note { font-size: 13px; color: var(--pilltxt); margin: 10px 0 0; line-height: 1.4; }
+  #pass { z-index: 3500; }
   #toast { position: fixed; left: 50%; bottom: calc(var(--sab) + 24px); transform: translateX(-50%); z-index: 4000; background: rgba(28,28,30,.95); color: #fff; padding: 10px 16px; border-radius: 999px; font-size: 14px; max-width: 90%; display: none; text-align: center; }
 </style>
 </head>
@@ -340,7 +341,7 @@
 <!-- Settings sheet -->
 <div id="settings" class="modal"><div class="panel">
   <h2>GitHub sync</h2>
-  <p class="note">Viewing works on any device with no setup. To add or edit sites on this device, paste a GitHub token once (it is stored only in this browser).</p>
+  <p class="note">Viewing works on any device with no setup. To add or edit sites, you need the GitHub token <b>and</b> your passcode. The token is stored encrypted with your passcode, so nobody can add URLs without it.</p>
   <div class="row2">
     <label>GitHub username<input id="cOwner" autocapitalize="off" autocorrect="off"></label>
     <label>Repository<input id="cRepo" autocapitalize="off" autocorrect="off"></label>
@@ -349,11 +350,22 @@
     <label>Branch<input id="cBranch" autocapitalize="off" placeholder="main"></label>
     <label>File<input id="cPath" autocapitalize="off" placeholder="sites.json"></label>
   </div>
-  <label>Token (fine-grained, Contents: read &amp; write)<input id="cToken" type="password" autocapitalize="off" autocorrect="off" placeholder="github_pat_..."></label>
+  <label>GitHub token (Contents: read &amp; write)<input id="cToken" type="password" autocapitalize="off" autocorrect="off" autocomplete="off" placeholder="github_pat_... (leave blank to keep current)"></label>
+  <label>Passcode (min 6 characters)<input id="cPass" type="password" autocapitalize="off" autocorrect="off" autocomplete="new-password" placeholder="choose a passcode"></label>
   <div class="pbtns">
     <button id="cClear" type="button">Remove token</button>
     <button id="cCancel" type="button">Cancel</button>
     <button id="cSave" class="pri" type="button">Save</button>
+  </div>
+</div></div>
+
+<!-- Passcode prompt -->
+<div id="pass" class="modal"><div class="panel">
+  <h2>Enter passcode</h2>
+  <label>Passcode<input id="pPass" type="password" autocapitalize="off" autocorrect="off" autocomplete="off"></label>
+  <div class="pbtns">
+    <button id="pCancel" type="button">Cancel</button>
+    <button id="pOk" class="pri" type="button">Unlock</button>
   </div>
 </div></div>
 
@@ -411,9 +423,57 @@
     return c;
   }
   let cfg = loadCfg();
-  const canWrite = () => !!(cfg.token && cfg.owner && cfg.repo);
+  /* ---------- PASSCODE LOCK (token is encrypted at rest, kept in memory only while unlocked) ---------- */
+  const TOK_KEY = 'gh_tok', LOCK_AFTER = 5 * 60 * 1000;
+  let TOKEN = null, lockTimer = null;
+  const hasTok = () => { try { return !!localStorage.getItem(TOK_KEY); } catch (e) { return false; } };
+  const _enc = new TextEncoder(), _dec = new TextDecoder();
+  const toB = a => btoa(String.fromCharCode.apply(null, new Uint8Array(a)));
+  const fromB = x => Uint8Array.from(atob(x), c => c.charCodeAt(0));
+  async function deriveKey(pass, salt) {
+    const km = await crypto.subtle.importKey('raw', _enc.encode(pass), 'PBKDF2', false, ['deriveKey']);
+    return crypto.subtle.deriveKey({ name: 'PBKDF2', salt: salt, iterations: 250000, hash: 'SHA-256' }, km, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+  }
+  async function encryptToken(token, pass) {
+    const salt = crypto.getRandomValues(new Uint8Array(16)), iv = crypto.getRandomValues(new Uint8Array(12));
+    const key = await deriveKey(pass, salt);
+    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, _enc.encode(token));
+    return { s: toB(salt), i: toB(iv), d: toB(ct) };
+  }
+  async function decryptToken(pass) {
+    const o = JSON.parse(localStorage.getItem(TOK_KEY));
+    const key = await deriveKey(pass, fromB(o.s));
+    return _dec.decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromB(o.i) }, key, fromB(o.d)));
+  }
+  function touch() { clearTimeout(lockTimer); lockTimer = setTimeout(() => { TOKEN = null; }, LOCK_AFTER); }
+  function lock() { TOKEN = null; clearTimeout(lockTimer); }
+  function askPass() {
+    return new Promise(res => {
+      $('pPass').value = ''; show('pass'); setTimeout(() => $('pPass').focus(), 60);
+      const done = v => { hide('pass'); $('pOk').onclick = $('pCancel').onclick = $('pPass').onkeydown = null; res(v); };
+      $('pOk').onclick = () => done($('pPass').value);
+      $('pCancel').onclick = () => done(null);
+      $('pPass').onkeydown = e => { if (e.key === 'Enter') done($('pPass').value); };
+    });
+  }
+  async function ensureUnlocked() {
+    if (TOKEN) { touch(); return true; }
+    for (let t = 0; t < 3; t++) {
+      const p = await askPass();
+      if (p === null) return false;
+      try { TOKEN = await decryptToken(p); touch(); refresh(); return true; }
+      catch (e) { toast('Wrong passcode' + (t < 2 ? ', try again' : '')); }
+    }
+    return false;
+  }
+  // Used before Add / Edit / Delete: needs a saved token and the passcode.
+  async function guard() {
+    if (!hasTok()) { toast('Set up your token and passcode first (gear)', 3500); openSettings(); return false; }
+    return ensureUnlocked();
+  }
+  const canWrite = () => !!(TOKEN && cfg.owner && cfg.repo);
   const apiUrl = () => 'https://api.github.com/repos/' + encodeURIComponent(cfg.owner) + '/' + encodeURIComponent(cfg.repo) + '/contents/' + cfg.path.split('/').map(encodeURIComponent).join('/');
-  const ghHeaders = () => ({ 'Accept': 'application/vnd.github+json', 'Authorization': 'Bearer ' + cfg.token });
+  const ghHeaders = () => ({ 'Accept': 'application/vnd.github+json', 'Authorization': 'Bearer ' + TOKEN });
   const b64enc = s => btoa(unescape(encodeURIComponent(s)));
   const b64dec = s => decodeURIComponent(escape(atob(s.replace(/\s/g, ''))));
 
@@ -689,14 +749,8 @@
   const show = id => $(id).classList.add('on');
   const hide = id => $(id).classList.remove('on');
 
-  function needSetup() {
-    if (canWrite()) return false;
-    toast('Add your GitHub token in settings (gear) first', 3500);
-    openSettings();
-    return true;
-  }
-  function openEditor(i) {
-    if (needSetup()) return;
+  async function openEditor(i) {
+    if (!(await guard())) return;
     editingId = i >= 0 ? sites[i].id : null;
     const s = i >= 0 ? sites[i] : { url: '', title: '', color: '', zoom: '', image: '' };
     $('sTitle').textContent = i >= 0 ? 'Edit site' : 'Add site';
@@ -757,20 +811,34 @@
   function openSettings() {
     cfg = loadCfg();
     $('cOwner').value = cfg.owner || ''; $('cRepo').value = cfg.repo || '';
-    $('cBranch').value = cfg.branch; $('cPath').value = cfg.path; $('cToken').value = cfg.token || '';
+    $('cBranch').value = cfg.branch; $('cPath').value = cfg.path;
+    $('cToken').value = ''; $('cPass').value = '';
+    $('cClear').style.display = hasTok() ? 'block' : 'none';
     show('settings');
   }
-  $('gear').addEventListener('click', openSettings);
+  $('gear').addEventListener('click', async () => {
+    if (hasTok() && !(await ensureUnlocked())) return;   // settings are locked once a passcode exists
+    openSettings();
+  });
   $('cCancel').addEventListener('click', () => hide('settings'));
-  $('cSave').addEventListener('click', () => {
-    const c = { owner: $('cOwner').value.trim(), repo: $('cRepo').value.trim(), branch: $('cBranch').value.trim() || 'main', path: $('cPath').value.trim() || 'sites.json', token: $('cToken').value.trim() };
-    try { localStorage.setItem(CFG_KEY, JSON.stringify(c)); } catch (e) {}
+  $('cSave').addEventListener('click', async () => {
+    const c = { owner: $('cOwner').value.trim(), repo: $('cRepo').value.trim(), branch: $('cBranch').value.trim() || 'main', path: $('cPath').value.trim() || 'sites.json' };
+    const tok = $('cToken').value.trim(), pass = $('cPass').value;
+    try {
+      if (tok || (pass && TOKEN)) {
+        if (pass.length < 6) { toast('Passcode must be at least 6 characters'); return; }
+        const t = tok || TOKEN;
+        localStorage.setItem(TOK_KEY, JSON.stringify(await encryptToken(t, pass)));
+        TOKEN = t; touch();
+      } else if (!hasTok()) { toast('Paste your GitHub token and choose a passcode'); return; }
+      localStorage.setItem(CFG_KEY, JSON.stringify(c));
+    } catch (e) { toast('Could not save: ' + e.message, 4000); return; }
     cfg = loadCfg(); hide('settings'); toast('Settings saved'); refresh();
   });
   $('cClear').addEventListener('click', () => {
-    const c = loadCfg(); delete c.token;
-    try { localStorage.setItem(CFG_KEY, JSON.stringify(c)); } catch (e) {}
-    cfg = loadCfg(); hide('settings'); toast('Token removed from this device');
+    if (!confirm('Remove the token and passcode from this device?')) return;
+    try { localStorage.removeItem(TOK_KEY); } catch (e) {}
+    lock(); hide('settings'); toast('Token removed from this device');
   });
 
   /* ---------- STARTUP ---------- */
